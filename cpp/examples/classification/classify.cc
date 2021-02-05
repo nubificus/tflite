@@ -22,6 +22,72 @@ int32_t ToInt32(const char p[4]) {
   return (p[3] << 24) | (p[2] << 16) | (p[1] << 8) | p[0];
 }
 
+std::vector<uint8_t> ReadBmpImageFromBuf(char* buf,
+                                  int* out_width = nullptr,
+                                  int* out_height = nullptr,
+                                  int* out_channels = nullptr) {
+  char header[kBmpHeaderSize];
+  memcpy(header, buf, sizeof(header));
+
+  const char* file_header = header;
+  const char* info_header = header + kBmpFileHeaderSize;
+  char *ptr = buf + sizeof(header);
+
+  if (file_header[0] != 'B' || file_header[1] != 'M')
+    return {};  // Invalid file type.
+
+  const int channels = info_header[14] / 8;
+  if (channels != 1 && channels != 3) return {};  // Unsupported bits per pixel.
+
+  if (ToInt32(&info_header[16]) != 0) return {};  // Unsupported compression.
+
+  uint32_t offset = ToInt32(&file_header[10]);
+#if 0
+  if (offset > kBmpHeaderSize)// && 
+      //!file.seekg(offset - kBmpHeaderSize, std::ios::cur))
+    return {};  // Seek failed.
+#endif
+
+  offset -= kBmpHeaderSize;
+  //printf("kBmpFileHeaderSize:%d\n", kBmpFileHeaderSize);
+  //printf("kBmpHeaderSize:%d\n", kBmpHeaderSize);
+  //printf("offset:%d\n", offset);
+  ptr = ptr+offset;
+  int width = ToInt32(&info_header[4]);
+  if (width < 0) return {};  // Invalid width.
+
+  int height = ToInt32(&info_header[8]);
+  const bool top_down = height < 0;
+  if (top_down) height = -height;
+
+  const int line_bytes = width * channels;
+  const int line_padding_bytes =
+      4 * ((8 * channels * width + 31) / 32) - line_bytes;
+  std::vector<uint8_t> image(line_bytes * height);
+  for (int i = 0; i < height; ++i) {
+    uint8_t* line = &image[(top_down ? i : (height - 1 - i)) * line_bytes];
+    memcpy(line, ptr, line_bytes);
+#if 0
+    if (!file.read(reinterpret_cast<char*>(line), line_bytes))
+      return {};  // Read failed.
+    if (!file.seekg(line_padding_bytes, std::ios::cur))
+      return {};  // Seek failed.
+#endif
+    //printf("line_bytes: %d line_padding_bytes:%d\n", line_bytes, line_padding_bytes);
+    ptr = ptr + line_padding_bytes;
+    ptr = ptr + line_bytes;
+    if (channels == 3) {
+      for (int j = 0; j < width; ++j) std::swap(line[3 * j], line[3 * j + 2]);
+    }
+  }
+
+  if (out_width) *out_width = width;
+  if (out_height) *out_height = height;
+  if (out_channels) *out_channels = channels;
+  return image;
+}
+
+
 std::vector<uint8_t> ReadBmpImage(const char* filename,
                                   int* out_width = nullptr,
                                   int* out_height = nullptr,
@@ -50,6 +116,9 @@ std::vector<uint8_t> ReadBmpImage(const char* filename,
       !file.seekg(offset - kBmpHeaderSize, std::ios::cur))
     return {};  // Seek failed.
 
+  printf("kBmpFileHeaderSize:%d\n", kBmpFileHeaderSize);
+  printf("kBmpHeaderSize:%d\n", kBmpHeaderSize);
+  printf("offset:%d\n", offset);
   int width = ToInt32(&info_header[4]);
   if (width < 0) return {};  // Invalid width.
 
@@ -63,6 +132,7 @@ std::vector<uint8_t> ReadBmpImage(const char* filename,
   std::vector<uint8_t> image(line_bytes * height);
   for (int i = 0; i < height; ++i) {
     uint8_t* line = &image[(top_down ? i : (height - 1 - i)) * line_bytes];
+    printf("line_bytes: %d line_padding_bytes:%d\n", line_bytes, line_padding_bytes);
     if (!file.read(reinterpret_cast<char*>(line), line_bytes))
       return {};  // Read failed.
     if (!file.seekg(line_padding_bytes, std::ios::cur))
@@ -117,18 +187,12 @@ std::vector<std::pair<int, float>> Sort(const std::vector<float>& scores,
 }
 }  // namespace
 
-int main(int argc, char* argv[]) {
-  if (argc != 5) {
-    std::cerr << argv[0]
-              << " <model_file> <label_file> <image_file> <threshold>"
-              << std::endl;
-    return 1;
-  }
-
-  const std::string model_file = argv[1];
-  const std::string label_file = argv[2];
-  const std::string image_file = argv[3];
-  const float threshold = std::stof(argv[4]);
+extern "C" int coral_classify(char *model_file_ptr, char *label_file_ptr, char *image_file_ptr, float thres, char **tags, size_t *out_len) 
+{
+  const std::string model_file (model_file_ptr);
+  const std::string label_file (label_file_ptr);
+  const std::string image_file (image_file_ptr);
+  const float threshold = thres;
 
   // Find TPU device.
   size_t num_devices;
@@ -151,7 +215,8 @@ int main(int argc, char* argv[]) {
   // Load image.
   int image_bpp, image_width, image_height;
   auto image =
-      ReadBmpImage(image_file.c_str(), &image_width, &image_height, &image_bpp);
+      ReadBmpImageFromBuf(image_file_ptr, &image_width, &image_height, &image_bpp);
+      //ReadBmpImage(image_file_ptr, &image_width, &image_height, &image_bpp);
   if (image.empty()) {
     std::cerr << "Cannot read image from " << image_file << std::endl;
     return 1;
@@ -174,7 +239,7 @@ int main(int argc, char* argv[]) {
 
   auto* delegate =
       edgetpu_create_delegate(device.type, device.path, nullptr, 0);
-  interpreter->ModifyGraphWithDelegate({delegate, edgetpu_free_delegate});
+  interpreter->ModifyGraphWithDelegate(delegate);
 
   // Allocate tensors.
   if (interpreter->AllocateTensors() != kTfLiteOk) {
@@ -204,9 +269,13 @@ int main(int argc, char* argv[]) {
 
   // Get interpreter output.
   auto results = Sort(Dequantize(*interpreter->output_tensor(0)), threshold);
+  *tags = strdup(GetLabel(labels, results[0].first).c_str());
+  *out_len = strlen(*tags);
+#if 0
   for (auto& result : results)
     std::cout << std::setw(7) << std::fixed << std::setprecision(5)
               << result.second << GetLabel(labels, result.first) << std::endl;
+#endif
 
   return 0;
 }
